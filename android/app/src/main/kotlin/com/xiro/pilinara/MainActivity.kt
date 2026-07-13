@@ -1,4 +1,4 @@
-package com.example.pilinara
+package com.xiro.pilinara
 
 import android.content.Intent
 import android.content.res.Configuration

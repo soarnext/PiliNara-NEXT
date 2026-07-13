@@ -7,7 +7,7 @@ project(runner LANGUAGES C CXX)
 set(BINARY_NAME "pilinara")
 # The unique GTK application identifier for this application. See:
 # https://wiki.gnome.org/HowDoI/ChooseApplicationID
-set(APPLICATION_ID "com.example.pilinara")
+set(APPLICATION_ID "com.xiro.pilinara")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.

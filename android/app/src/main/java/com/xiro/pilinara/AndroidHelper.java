@@ -1,4 +1,4 @@
-package com.example.pilinara;
+package com.xiro.pilinara;
 
 import android.app.Activity;
 import android.app.PendingIntent;

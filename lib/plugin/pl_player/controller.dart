@@ -855,6 +855,8 @@ class PlPlayerController with BlockConfigMixin {
     final opt = {
       'video-sync': Pref.videoSync,
       if (Platform.isAndroid) 'ao': Pref.audioOutput,
+      // ponytail: vo=gpu enables MediaCodec hwdec on Android
+      if (Platform.isAndroid && hwdec != null) 'vo': 'gpu',
       'volume': (PlatformUtils.isMobile
               ? (Pref.enableAppVolume ? volume.value * 100 : Pref.playerVolume)
               : volume.value * 100)

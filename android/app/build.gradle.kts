@@ -18,7 +18,7 @@ if (!isBuiltInKotlinEnabled) {
 }
 
 android {
-    namespace = "com.example.pilinara"
+    namespace = "com.xiro.pilinara"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -28,7 +28,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.pilinara"
+        applicationId = "com.xiro.pilinara"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
