@@ -1309,7 +1309,7 @@ class PlPlayerController with BlockConfigMixin {
 
       /// position
       stream.position.listen((Duration position) {
-        _updateExternalSubtitle(position);
+    _updateExternalSubtitle(Duration(seconds: position.value));
         final posInSeconds = position.inSeconds;
 
         if (posInSeconds != this.position.value) {
@@ -1447,9 +1447,9 @@ class PlPlayerController with BlockConfigMixin {
           element(status);
         }
         if (status == PlayerStatus.completed) {
-          makeHeartBeat(positionSeconds.value, type: HeartBeatType.completed);
-        } else if (positionSeconds.value != 0) {
-          makeHeartBeat(positionSeconds.value, type: HeartBeatType.status);
+          makeHeartBeat(position.value, type: HeartBeatType.completed);
+        } else if (position.value != 0) {
+          makeHeartBeat(position.value, type: HeartBeatType.status);
         }
       }
       if (event.position case final eventPosition?) {
@@ -1468,7 +1468,6 @@ class PlPlayerController with BlockConfigMixin {
       }
       if (event.buffered case final eventBuffered?) {
         buffered.value = eventBuffered.inSeconds;
-        updateBufferedSecond();
       }
       if (event.buffering case final eventBuffering?) {
         isBuffering.value = eventBuffering;
@@ -1939,7 +1938,7 @@ class PlPlayerController with BlockConfigMixin {
 
   void onForwardBackward(Duration duration) {
     seekTo(
-      duration.clamp(Duration.zero, this.duration.value),
+      duration.clamp(Duration.zero, Duration(seconds: this.duration.value)),
       isSeek: false,
     ).whenComplete(play);
   }
@@ -2227,7 +2226,7 @@ class PlPlayerController with BlockConfigMixin {
       debugPrint('dispose player');
     }
     _disposeMediaKitPlayer();
-    await _disposeAndroidHdrBackend();
+    _disposeAndroidHdrBackend();
     _activeVideoContextKey = null;
     _instance = null;
     videoPlayerServiceHandler?.clear();
