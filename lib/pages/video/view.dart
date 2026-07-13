@@ -878,7 +878,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     // 检查并恢复播放器实例
     // 场景：1. 播放器被销毁（小窗关闭） 2. 播放器被抢占（在其它页面播放了新的视频/直播）
     bool needsRecovery = false;
-    if (plPlayerController?.videoPlayerController == null) {
+    if (plPlayerController?.hasVideoView != true) {
       needsRecovery = true;
     } else if (plPlayerController!.isLive ||
         plPlayerController!.cid != videoDetailController.cid.value) {
@@ -1753,7 +1753,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       () =>
           (!isPipMode && !videoDetailController.videoState.value) ||
               !videoDetailController.autoPlay ||
-              plPlayerController?.videoController == null
+              plPlayerController?.hasVideoView != true
           ? const SizedBox.shrink()
           : PLVideoPlayer(
               maxWidth: width,

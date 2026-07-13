@@ -29,6 +29,8 @@ import 'package:PiliPlus/plugin/pl_player/models/fullscreen_mode.dart';
 import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
+import 'package:PiliPlus/plugin/pl_player/models/playback_backend.dart';
+import 'package:PiliPlus/plugin/pl_player/models/android_hdr_playback_backend.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/services/live_pip_overlay_service.dart';
@@ -74,6 +76,9 @@ typedef PlayCallback = Future<void>? Function();
 class PlPlayerController with BlockConfigMixin {
   Player? _videoPlayerController;
   VideoController? _videoController;
+  AndroidHdrPlaybackBackend? _androidHdrBackend;
+  StreamSubscription<PlaybackBackendEvent>? _backendSubscription;
+  bool _androidHdrAudioDisabled = false;
 
   static PlPlayerController? _instance;
 
@@ -189,6 +194,15 @@ class PlPlayerController with BlockConfigMixin {
   /// [videoController] instance of Player
   VideoController? get videoController => _videoController;
 
+  AndroidHdrPlaybackBackend? get androidHdrBackend => _androidHdrBackend;
+
+  bool get isAndroidHdrBackend => _androidHdrBackend != null;
+
+  final RxInt videoViewVersion = 0.obs;
+
+  bool get hasVideoView =>
+      _videoController != null || _androidHdrBackend != null;
+
   bool isMuted = false;
 
   /// 听视频
@@ -254,9 +268,9 @@ class PlPlayerController with BlockConfigMixin {
     }
 
     final Size size;
-    final state = videoPlayerController!.state;
-    int width = state.width;
-    int height = state.height;
+    final state = _androidHdrBackend?.state;
+    int width = state?.width ?? videoPlayerController?.state.width ?? 0;
+    int height = state?.height ?? videoPlayerController?.state.height ?? 0;
     if (width == 0) {
       width = this.width ?? 16;
     }
@@ -304,12 +318,16 @@ class PlPlayerController with BlockConfigMixin {
   }
 
   void enterPip({bool autoEnter = false}) {
-    if (videoPlayerController != null) {
-      final state = videoPlayerController!.state;
+    if (hasVideoView) {
+      final state = _androidHdrBackend?.state;
+      final stateWidth =
+          state?.width ?? videoPlayerController?.state.width ?? 0;
+      final stateHeight =
+          state?.height ?? videoPlayerController?.state.height ?? 0;
       PageUtils.enterPip(
         autoEnter: autoEnter,
-        width: state.width == 0 ? width : state.width,
-        height: state.height == 0 ? height : state.height,
+        width: stateWidth == 0 ? width : stateWidth,
+        height: stateHeight == 0 ? height : stateHeight,
         isLive: isLive,
         isPlaying: playerStatus.isPlaying,
       );
@@ -455,6 +473,36 @@ class PlPlayerController with BlockConfigMixin {
 
   void updateSubtitleStyle() {
     subtitleConfig.value = getSubConfig;
+  }
+
+  final RxString currentSubtitleText = ''.obs;
+  List<_SubtitleCue> _subtitleCues = const [];
+
+  void setExternalSubtitleData(String? data) {
+    if (data == null || data.isEmpty) {
+      _subtitleCues = const [];
+      currentSubtitleText.value = '';
+      return;
+    }
+    _subtitleCues = _SubtitleCue.parse(data);
+    _updateExternalSubtitle(position);
+  }
+
+  void _updateExternalSubtitle(Duration position) {
+    if (_subtitleCues.isEmpty) {
+      if (currentSubtitleText.value.isNotEmpty) {
+        currentSubtitleText.value = '';
+      }
+      return;
+    }
+    final text = _subtitleCues
+        .where((cue) => cue.start <= position && position < cue.end)
+        .map((cue) => cue.text)
+        .where((text) => text.isNotEmpty)
+        .join('\n');
+    if (text != currentSubtitleText.value) {
+      currentSubtitleText.value = text;
+    }
   }
 
   void onUpdatePadding(EdgeInsets padding) {
@@ -726,6 +774,7 @@ class PlPlayerController with BlockConfigMixin {
       this.width = width;
       this.height = height;
       this.dataSource = dataSource;
+      _androidHdrAudioDisabled = false;
       _autoPlay = autoplay;
       // 初始化视频倍速
       // _playbackSpeed.value = speed;
@@ -755,17 +804,18 @@ class PlPlayerController with BlockConfigMixin {
         return;
       }
       // 配置Player 音轨、字幕等等
-      await _createVideoController(dataSource, seekTo, volume);
+      await _createPlaybackBackend(dataSource, seekTo, volume, duration);
 
       if (_playerCount == 0) {
         _removeListeners();
         _videoPlayerController?.dispose();
+        await _disposeAndroidHdrBackend();
         _videoPlayerController = null;
         _videoController = null;
         return;
       }
 
-      updateDuration(duration ?? _videoPlayerController!.state.duration);
+      updateDuration(duration ?? _androidHdrBackend?.state.duration ?? _videoPlayerController?.state.duration ?? Duration.zero);
       position.value = buffered.value = seekTo?.inSeconds ?? 0;
 
       dataStatus.value = .loaded;
@@ -815,7 +865,14 @@ class PlPlayerController with BlockConfigMixin {
         setting.put(SettingBoxKey.superResolutionType, type.index);
       }
     }
-    pp ??= _videoPlayerController!;
+    if (type != SuperResolutionType.disable && isAndroidHdrBackend) {
+      await switchToMediaKitBackend(
+        reason: 'SuperResolution is not compatible with HDR: not implemented',
+      );
+    }
+    if (_videoPlayerController == null) return;
+    pp ??= _videoPlayerController;
+    if (pp == null) return;
     switch (type) {
       case SuperResolutionType.disable:
         return pp.command(const ['change-list', 'glsl-shaders', 'clr', '']);
@@ -844,8 +901,173 @@ class PlPlayerController with BlockConfigMixin {
 
   static final loudnormRegExp = RegExp('loudnorm=([^,]+)');
 
+  static const Set<int> _hdrQualityCodes = {
+    125,
+    126,
+    129,
+  };
+
+  int? get _currentQualityCode {
+    return dataSource.qualityCode ?? cacheVideoQa;
+  }
+
+  bool get _isHdrQuality {
+    final quality = _currentQualityCode;
+    return quality != null && _hdrQualityCodes.contains(quality);
+  }
+
+  bool get _requiresMpvOnlyFeature =>
+      flipX.value ||
+      flipY.value ||
+      onlyPlayAudio.value ||
+      superResolutionType.value != SuperResolutionType.disable;
+
+  bool shouldUseAndroidHdrForCurrentSource([int? qualityCode]) {
+    final targetQuality = qualityCode ?? _currentQualityCode;
+    return Pref.androidHdrPlayback &&
+        Platform.isAndroid &&
+        !isLive &&
+        targetQuality != null &&
+        _hdrQualityCodes.contains(targetQuality) &&
+        !_requiresMpvOnlyFeature;
+  }
+
+  Future<bool> _shouldUseAndroidHdrBackend() async {
+    final enabled = Pref.androidHdrPlayback;
+    final android = Platform.isAndroid;
+    final hdrQuality = _isHdrQuality;
+    final requiresMpv = _requiresMpvOnlyFeature;
+    if (!enabled || !android || isLive || !hdrQuality || requiresMpv) {
+      return false;
+    }
+    final supportsHdr = await AndroidHdrPlaybackBackend.supportsHdr(
+      qualityCode: _currentQualityCode,
+    );
+    return supportsHdr;
+  }
+
+  Future<void> _createPlaybackBackend(
+    DataSource dataSource,
+    Duration? seekTo,
+    Volume? volume,
+    Duration? duration,
+  ) async {
+    if (await _shouldUseAndroidHdrBackend()) {
+      try {
+        await _createAndroidHdrBackend(dataSource, seekTo, duration);
+        return;
+      } catch (err, stackTrace) {
+        if (kDebugMode) {
+          debugPrint('Android HDR backend failed: $err\n$stackTrace');
+        }
+        await _disposeAndroidHdrBackend();
+        SmartDialog.showToast('已使用兼容播放');
+      }
+    }
+    await _createVideoController(dataSource, seekTo, volume);
+  }
+
+  Future<void> _createAndroidHdrBackend(
+    DataSource dataSource,
+    Duration? seekTo,
+    Duration? duration,
+  ) async {
+    await _disposeMediaKitPlayer();
+    await _disposeAndroidHdrBackend();
+    isBuffering.value = false;
+    buffered.value = 0;
+    _heartDuration = 0;
+    final startSeconds = seekTo?.inSeconds ?? 0;
+    position.value = buffered.value = startSeconds;
+    danmakuController?.clear();
+
+    final backend = AndroidHdrPlaybackBackend();
+    _androidHdrBackend = backend;
+    videoViewVersion.value++;
+    _startBackendListeners(backend);
+    await backend.open(
+      _androidHdrAudioDisabled
+          ? _withoutAudio(dataSource)
+          : dataSource,
+      start: seekTo,
+      duration: duration,
+      headers: {
+        'User-Agent': BrowserUa.pc,
+        'Referer': HttpString.baseUrl,
+      },
+      fit: videoFit.value,
+    );
+  }
+
+  Future<void> switchToMediaKitBackend({String? reason}) async {
+    if (!isAndroidHdrBackend || _processing || _playerCount == 0) {
+      return;
+    }
+    final wasPlaying = playerStatus.isPlaying;
+    final seekTo = Duration(seconds: position.value);
+    await _disposeAndroidHdrBackend();
+    await _createVideoController(dataSource, seekTo, null);
+    await _initializePlayer();
+    if (!wasPlaying) {
+      await pause(notify: false);
+    }
+    if (reason != null) {
+      SmartDialog.showToast(reason);
+    }
+  }
+
+  Future<void> setFlipX(bool value) async {
+    flipX.value = value;
+    if (value) {
+      await switchToMediaKitBackend(reason: '已切换兼容播放以启用镜像');
+    }
+  }
+
+  Future<void> setFlipY(bool value) async {
+    flipY.value = value;
+    if (value) {
+      await switchToMediaKitBackend(reason: '已切换兼容播放以启用镜像');
+    }
+  }
+
+  Future<void> _refreshAndroidHdrPlayer() async {
+    if (!isAndroidHdrBackend || _processing || _playerCount == 0) return;
+    final wasPlaying = playerStatus.isPlaying;
+    final seekTo = Duration(seconds: position.value);
+    await _disposeAndroidHdrBackend();
+    await _createAndroidHdrBackend(dataSource, seekTo, Duration(seconds: duration.value));
+    await _initializePlayer();
+    if (!wasPlaying) {
+      await pause(notify: false);
+    }
+  }
+
+  Future<void> _disposeMediaKitPlayer() async {
+    _removeListeners();
+    final hadPlayer =
+        _videoPlayerController != null || _videoController != null;
+    await _videoPlayerController?.dispose();
+    _videoPlayerController = null;
+    _videoController = null;
+    if (hadPlayer) {
+      videoViewVersion.value++;
+    }
+  }
+
+  Future<void> _disposeAndroidHdrBackend() async {
+    _backendSubscription?.cancel();
+    _backendSubscription = null;
+    final backend = _androidHdrBackend;
+    _androidHdrBackend = null;
+    if (backend != null) {
+      videoViewVersion.value++;
+    }
+    await backend?.dispose();
+  }
+
   Future<Player> _initPlayer() async {
     assert(_videoPlayerController == null);
+    await _disposeAndroidHdrBackend();
     if (PlatformUtils.isMobile && Pref.enableAppVolume) {
       // 移动平台应用内音量模式：初始化系统音量
       systemVolume.value = (await FlutterVolumeController.getVolume()) ?? 1.0;
@@ -923,6 +1145,7 @@ class PlPlayerController with BlockConfigMixin {
         return;
       }
       _videoPlayerController = player;
+      videoViewVersion.value++;
       if (isAnim && superResolutionType.value != .disable) {
         await setShader();
       }
@@ -988,6 +1211,9 @@ class PlPlayerController with BlockConfigMixin {
   Future<void>? refreshPlayer() {
     if (dataSource is FileSource) {
       return null;
+    }
+    if (_androidHdrBackend != null) {
+      return _refreshAndroidHdrPlayer();
     }
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       return ctr.open(
@@ -1083,6 +1309,7 @@ class PlPlayerController with BlockConfigMixin {
 
       /// position
       stream.position.listen((Duration position) {
+        _updateExternalSubtitle(position);
         final posInSeconds = position.inSeconds;
 
         if (posInSeconds != this.position.value) {
@@ -1179,6 +1406,134 @@ class PlPlayerController with BlockConfigMixin {
     _subscriptions?.forEach((e) => e.cancel());
     _subscriptions?.clear();
     _subscriptions = null;
+    _backendSubscription?.cancel();
+    _backendSubscription = null;
+  }
+
+  void _startBackendListeners(AndroidHdrPlaybackBackend backend) {
+    _backendSubscription?.cancel();
+    _backendSubscription = backend.events.listen((event) {
+      if (event.ready) {
+        dataStatus.value = DataStatus.loaded;
+        isBuffering.value = false;
+      }
+      if (event.status case final status?) {
+        dataStatus.value = DataStatus.loaded;
+        if (status == PlayerStatus.playing || status == PlayerStatus.paused) {
+          isBuffering.value = false;
+        }
+        if (status == PlayerStatus.playing) {
+          WakelockPlus.enable();
+          if (_isAutoEnterPip) {
+            if (_isCurrVideoPage || _isInInAppPip) {
+              enterPip(autoEnter: true);
+            } else {
+              _disableAutoEnterPip();
+            }
+          }
+        } else {
+          _disableAutoEnterPip();
+          if (status != PlayerStatus.completed) {
+            WakelockPlus.disable();
+          }
+        }
+        playerStatus.value = status;
+        videoPlayerServiceHandler?.onStatusChange(
+          status,
+          isBuffering.value,
+          isLive,
+        );
+        for (final element in _statusListeners) {
+          element(status);
+        }
+        if (status == PlayerStatus.completed) {
+          makeHeartBeat(positionSeconds.value, type: HeartBeatType.completed);
+        } else if (positionSeconds.value != 0) {
+          makeHeartBeat(positionSeconds.value, type: HeartBeatType.status);
+        }
+      }
+      if (event.position case final eventPosition?) {
+        dataStatus.value = DataStatus.loaded;
+        isBuffering.value = false;
+        final posInSeconds = eventPosition.inSeconds;
+        if (posInSeconds != position.value) {
+          position.value = posInSeconds;
+        }
+        _updateExternalSubtitle(eventPosition);
+        makeHeartBeat(eventPosition.inSeconds);
+      }
+      if (event.duration case final eventDuration?
+          when eventDuration != Duration.zero) {
+        updateDuration(eventDuration);
+      }
+      if (event.buffered case final eventBuffered?) {
+        buffered.value = eventBuffered.inSeconds;
+        updateBufferedSecond();
+      }
+      if (event.buffering case final eventBuffering?) {
+        isBuffering.value = eventBuffering;
+        videoPlayerServiceHandler?.onStatusChange(
+          playerStatus.value,
+          eventBuffering,
+          isLive,
+        );
+      }
+      if (event.width case final eventWidth? when eventWidth > 0) {
+        width = eventWidth;
+      }
+      if (event.height case final eventHeight? when eventHeight > 0) {
+        height = eventHeight;
+      }
+      if (event.error case final message?) {
+        _handleBackendError(message);
+      }
+    });
+  }
+
+  void _handleBackendError(String event) {
+    if (!isAndroidHdrBackend) return;
+    Future.microtask(() async {
+      final seekTo = Duration(seconds: position.value);
+      if (!_androidHdrAudioDisabled && _isAndroidHdrAudioError(event)) {
+        _androidHdrAudioDisabled = true;
+        final wasPlaying = playerStatus.isPlaying;
+        await _disposeAndroidHdrBackend();
+        await _createAndroidHdrBackend(dataSource, seekTo, Duration(seconds: duration.value));
+        await _initializePlayer();
+        if (!wasPlaying) {
+          await pause(notify: false);
+        }
+        return;
+      }
+      await _disposeAndroidHdrBackend();
+      SmartDialog.showToast('已使用兼容播放');
+      await _createVideoController(dataSource, seekTo, null);
+      await _initializePlayer();
+    });
+  }
+
+  bool _isAndroidHdrAudioError(String event) {
+    final text = event.toLowerCase();
+    return text.contains('audio_renderer_error') ||
+        text.contains('audiorenderer') ||
+        text.contains('mediacodecaudiorenderer') ||
+        text.contains('audiosink') ||
+        text.contains('exoplayer.audio') ||
+        text.contains('audio/') ||
+        text.contains('dolby.eac3') ||
+        text.contains('eac3') ||
+        text.contains('ec-3');
+  }
+
+  DataSource _withoutAudio(DataSource source) {
+    return switch (source) {
+      NetworkSource() => NetworkSource(
+        videoSource: source.videoSource,
+        audioSource: null,
+        qualityCode: source.qualityCode,
+      ),
+      FileSource() => source,
+    };
   }
 
   void _cancelSubForSeek() {
@@ -1201,11 +1556,17 @@ class PlPlayerController with BlockConfigMixin {
     Future<void> seek() async {
       if (isSeek) {
         /// 拖动进度条调节时，不等待第一帧，防止抖动
-        await _videoPlayerController?.stream.buffer.first;
+        if (_videoPlayerController != null) {
+          await _videoPlayerController?.stream.buffer.first;
+        }
       }
       danmakuController?.clear();
       try {
-        await _videoPlayerController?.seek(position);
+        if (_androidHdrBackend case final backend?) {
+          await backend.seek(position);
+        } else {
+          await _videoPlayerController?.seek(position);
+        }
       } catch (e) {
         if (kDebugMode) debugPrint('seek failed: $e');
       }
@@ -1227,11 +1588,14 @@ class PlPlayerController with BlockConfigMixin {
   Future<void> setPlaybackSpeed(double speed) async {
     lastPlaybackSpeed = playbackSpeed;
 
-    if (speed == _videoPlayerController?.state.rate) {
+    if (speed ==
+        (_androidHdrBackend?.state.rate ??
+            _videoPlayerController?.state.rate)) {
       return;
     }
 
-    await _videoPlayerController?.setRate(speed);
+    await (_androidHdrBackend?.setPlaybackSpeed(speed) ??
+        _videoPlayerController?.setRate(speed));
     _playbackSpeed.value = speed;
     if (danmakuController != null) {
       try {
@@ -1251,7 +1615,8 @@ class PlPlayerController with BlockConfigMixin {
   // 还原默认速度
   double playSpeedDefault = Pref.playSpeedDefault;
   Future<void> setDefaultSpeed() async {
-    await _videoPlayerController?.setRate(playSpeedDefault);
+    await (_androidHdrBackend?.setPlaybackSpeed(playSpeedDefault) ??
+        _videoPlayerController?.setRate(playSpeedDefault));
     _playbackSpeed.value = playSpeedDefault;
   }
 
@@ -1281,7 +1646,7 @@ class PlPlayerController with BlockConfigMixin {
       await seekTo(Duration.zero, isSeek: false);
     }
 
-    await _videoPlayerController?.play();
+    await (_androidHdrBackend?.play() ?? _videoPlayerController?.play());
 
     audioSessionHandler?.setActive(true);
 
@@ -1291,7 +1656,7 @@ class PlPlayerController with BlockConfigMixin {
 
   /// 暂停播放
   Future<void> pause({bool notify = true, bool isInterrupt = false}) async {
-    await _videoPlayerController?.pause();
+    await (_androidHdrBackend?.pause() ?? _videoPlayerController?.pause());
     playerStatus.value = PlayerStatus.paused;
 
     // 主动暂停时让出音频焦点
@@ -1360,7 +1725,7 @@ class PlPlayerController with BlockConfigMixin {
       this.volume.value = volume;
       try {
         if (PlatformUtils.isDesktop) {
-          await _videoPlayerController!.setVolume(volume * 100);
+          await _videoPlayerController?.setVolume(volume * 100);
         } else {
           // 移动平台：根据设置选择音量控制方式
           if (Pref.enableAppVolume) {
@@ -1468,6 +1833,7 @@ class PlPlayerController with BlockConfigMixin {
   /// Toggle Change the videofit accordingly
   void toggleVideoFit(VideoFitType value) {
     _prefFit = videoFit.value = value;
+    _androidHdrBackend?.setFit(value);
     video.put(VideoBoxKey.cacheVideoFit, value.index);
   }
 
@@ -1533,16 +1899,22 @@ class PlPlayerController with BlockConfigMixin {
   }
 
   bool get isCompleted =>
-      videoPlayerController!.state.completed ||
+      (_androidHdrBackend?.state.completed ??
+          videoPlayerController?.state.completed ??
+          false) ||
       durationInMilliseconds - positionInMilliseconds <= 50;
 
   // 双击播放、暂停
   Future<void> onDoubleTapCenter() async {
     if (!isLive && isCompleted) {
-      await videoPlayerController!.seek(Duration.zero);
-      videoPlayerController!.play();
+      await seekTo(Duration.zero, isSeek: false);
+      await play();
     } else {
-      videoPlayerController!.playOrPause();
+      if (playerStatus.isPlaying) {
+        await pause();
+      } else {
+        await play();
+      }
     }
   }
 
@@ -1567,7 +1939,7 @@ class PlPlayerController with BlockConfigMixin {
 
   void onForwardBackward(Duration duration) {
     seekTo(
-      duration.clamp(Duration.zero, videoPlayerController!.state.duration),
+      duration.clamp(Duration.zero, this.duration.value),
       isSeek: false,
     ).whenComplete(play);
   }
@@ -1854,9 +2226,8 @@ class PlPlayerController with BlockConfigMixin {
     if (kDebugMode) {
       debugPrint('dispose player');
     }
-    _videoPlayerController?.dispose();
-    _videoPlayerController = null;
-    _videoController = null;
+    _disposeMediaKitPlayer();
+    await _disposeAndroidHdrBackend();
     _activeVideoContextKey = null;
     _instance = null;
     videoPlayerServiceHandler?.clear();
@@ -1880,11 +2251,28 @@ class PlPlayerController with BlockConfigMixin {
     }
   }
 
-  void setOnlyPlayAudio() {
+  Future<void> setOnlyPlayAudio() async {
     onlyPlayAudio.value = !onlyPlayAudio.value;
-    videoPlayerController?.setVideoTrack(
+    if (onlyPlayAudio.value && isAndroidHdrBackend) {
+      await switchToMediaKitBackend(reason: '已切换兼容播放以启用听视频');
+      return;
+    }
+    await videoPlayerController?.setVideoTrack(
       onlyPlayAudio.value ? VideoTrack.no() : VideoTrack.auto(),
     );
+  }
+
+  Future<void> setSubtitleTrack(SubtitleTrack track) async {
+    if (track.id == 'no') {
+      setExternalSubtitleData(null);
+    }
+    await videoPlayerController?.setSubtitleTrack(track);
+  }
+
+  Future<void> setMuted(bool muted) async {
+    isMuted = muted;
+    await (_androidHdrBackend?.setVolume(muted ? 0 : volume.value) ??
+        _videoPlayerController?.setVolume(muted ? 0 : volume.value * 100));
   }
 
   late final Map<String, ui.Image?> previewCache = {};
@@ -2066,6 +2454,21 @@ class PlPlayerController with BlockConfigMixin {
     final time = DurationUtils.formatDuration(
       positionInMilliseconds / 1000,
     ).replaceAll(':', '-');
+    if (_androidHdrBackend != null) {
+      final bytes = await _androidHdrBackend!.screenshot();
+      if (bytes != null) {
+        SmartDialog.showToast('点击弹窗保存截图');
+        ImageUtils.saveByteImg(
+          bytes: bytes,
+          fileName: 'screenshot_${cid}_$time',
+        );
+      } else {
+        SmartDialog.showToast(
+          'HDR 原生播放截图失败，请切换兼容播放',
+        );
+      }
+      return;
+    }
     final image = await videoPlayerController?.screenshot();
     if (image != null) {
       SmartDialog.showToast('点击弹窗保存截图');
@@ -2147,5 +2550,96 @@ class PlPlayerController with BlockConfigMixin {
       return;
     }
     Get.back();
+  }
+}
+
+final class _SubtitleCue {
+  const _SubtitleCue(this.start, this.end, this.text);
+
+  final Duration start;
+  final Duration end;
+  final String text;
+
+  static List<_SubtitleCue> parse(String data) {
+    final text = data.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    if (text.contains('[Events]') || text.contains('Dialogue:')) {
+      return _parseAss(text);
+    }
+    if (text.contains('-->')) {
+      return _parseVttOrSrt(text);
+    }
+    return const [];
+  }
+
+  static List<_SubtitleCue> _parseVttOrSrt(String data) {
+    final cues = <_SubtitleCue>[];
+    final blocks = data.split(RegExp(r'\n{2,}'));
+    for (final block in blocks) {
+      final lines = block
+          .split('\n')
+          .map((line) => line.trim())
+          .where((line) => line.isNotEmpty && line != 'WEBVTT')
+          .toList();
+      if (lines.isEmpty) continue;
+      final timeIndex = lines.indexWhere((line) => line.contains('-->'));
+      if (timeIndex == -1) continue;
+      final parts = lines[timeIndex].split('-->');
+      if (parts.length < 2) continue;
+      final start = _parseTime(parts[0].trim());
+      final end = _parseTime(parts[1].trim().split(RegExp(r'\s+')).first);
+      if (start == null || end == null || end <= start) continue;
+      final cueText = lines.skip(timeIndex + 1).map(_cleanText).join('\n');
+      cues.add(_SubtitleCue(start, end, cueText));
+    }
+    return cues;
+  }
+
+  static List<_SubtitleCue> _parseAss(String data) {
+    final cues = <_SubtitleCue>[];
+    for (final line in data.split('\n')) {
+      if (!line.startsWith('Dialogue:')) continue;
+      final body = line.substring('Dialogue:'.length).trimLeft();
+      final fields = body.split(',');
+      if (fields.length < 10) continue;
+      final start = _parseTime(fields[1].trim());
+      final end = _parseTime(fields[2].trim());
+      if (start == null || end == null || end <= start) continue;
+      final cueText = _cleanText(fields.skip(9).join(','));
+      cues.add(_SubtitleCue(start, end, cueText));
+    }
+    return cues;
+  }
+
+  static Duration? _parseTime(String input) {
+    final time = input.trim().replaceAll(',', '.');
+    final match = RegExp(
+      r'(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?',
+    ).firstMatch(time);
+    if (match == null) return null;
+    final hours = int.tryParse(match.group(1) ?? '0') ?? 0;
+    final minutes = int.tryParse(match.group(2) ?? '0') ?? 0;
+    final seconds = int.tryParse(match.group(3) ?? '0') ?? 0;
+    final millisText = (match.group(4) ?? '').padRight(3, '0');
+    final millis =
+        int.tryParse(
+          millisText.length > 3 ? millisText.substring(0, 3) : millisText,
+        ) ??
+        0;
+    return Duration(
+      hours: hours,
+      minutes: minutes,
+      seconds: seconds,
+      milliseconds: millis,
+    );
+  }
+
+  static String _cleanText(String text) {
+    return text
+        .replaceAll(RegExp(r'\{[^}]*\}'), '')
+        .replaceAll(RegExp(r'<[^>]*>'), '')
+        .replaceAll(r'\N', '\n')
+        .replaceAll(r'\n', '\n')
+        .replaceAll(r'\h', ' ')
+        .trim();
   }
 }
