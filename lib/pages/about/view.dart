@@ -121,18 +121,16 @@ class _AboutPageState extends State<AboutPage> {
               textAlign: TextAlign.center,
               style: theme.textTheme.titleMedium!.copyWith(height: 2),
             ),
-            subtitle: Row(
+            subtitle: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Text(
-                  '基于PiliPlus做了一些自用修改',
+                  '基于PiliPlus修改，NEXT 分支持续追踪上游',
                   style: TextStyle(color: outline),
-                  semanticsLabel: '与你一起，发现不一样的世界',
                 ),
-                const Icon(
-                  Icons.accessibility_new,
-                  semanticLabel: "无障碍适配",
-                  size: 18,
+                Text(
+                  '自用修改，随缘更新',
+                  style: TextStyle(color: outline, fontSize: 12),
                 ),
               ],
             ),
