@@ -485,7 +485,7 @@ class PlPlayerController with BlockConfigMixin {
       return;
     }
     _subtitleCues = _SubtitleCue.parse(data);
-    _updateExternalSubtitle(position);
+    _updateExternalSubtitle(Duration(seconds: position.value));
   }
 
   void _updateExternalSubtitle(Duration position) {
@@ -1309,7 +1309,7 @@ class PlPlayerController with BlockConfigMixin {
 
       /// position
       stream.position.listen((Duration position) {
-    _updateExternalSubtitle(Duration(seconds: position.value));
+        _updateExternalSubtitle(position);
         final posInSeconds = position.inSeconds;
 
         if (posInSeconds != this.position.value) {
